@@ -1,10 +1,15 @@
-FROM mcr.microsoft.com/playwright/python:v1.55.0-jammy
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+FROM python:3.11-slim
+
 WORKDIR /app
+
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install --with-deps chromium
+
+# Copy the rest of the app
 COPY . .
+
 ENV PORT=8080
-EXPOSE 8080
-CMD ["python", "-m", "uvicorn", "po_svc:app", "--host", "0.0.0.0", "--port", "8080"]
+
+# Start FastAPI with uvicorn
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
