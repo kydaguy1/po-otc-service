@@ -24,4 +24,4 @@ ENV PYTHONUNBUFFERED=1 \
 EXPOSE 8000
 
 # IMPORTANT: your code must have `main.py` at repo root and inside it: `app = FastAPI()`
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "0.0.0.0:$PORT"]
+CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
