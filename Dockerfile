@@ -2,26 +2,16 @@
 FROM python:3.11-slim
 
 WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
-# System deps (lightweight)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl build-essential \
- && rm -rf /var/lib/apt/lists/*
-
-# Copy reqs first for better caching
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest
 COPY . .
 
-# Make sure Python can import from /app no matter where Render launches from
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app
-
+# Render provides PORT; keep a default for local runs
+ENV PORT=8000
 EXPOSE 8000
 
-# IMPORTANT: your code must have `main.py` at repo root and inside it: `app = FastAPI()`
-CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
+# 👈 IMPORTANT: entrypoint is po_svc:app (not main:app)
+CMD ["sh","-c","python -m uvicorn po_svc:app --host 0.0.0.0 --port ${PORT}"]
