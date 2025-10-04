@@ -1,26 +1,27 @@
-# Use an official lightweight Python image
+# Dockerfile
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+# System deps (lightweight)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl build-essential \
+ && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first (for better caching)
+# Copy reqs first for better caching
 COPY requirements.txt .
 
-# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of your project files
+# Copy the rest
 COPY . .
 
-# Expose the port (Render provides $PORT)
+# Make sure Python can import from /app no matter where Render launches from
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
 EXPOSE 8000
 
-# Start the app (changed from po_api:app to main:app)
-CMD uvicorn main:app --host 0.0.0.0 --port $PORT
+# IMPORTANT: your code must have `main.py` at repo root and inside it: `app = FastAPI()`
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "0.0.0.0:$PORT"]
