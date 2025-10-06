@@ -1,18 +1,33 @@
-# po_svc.py
 import os
-from typing import List, Dict
+import logging
+from typing import List, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Header, status, Query
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import JSONResponse
 
-from scraper import fetch_candles_async  # <-- async, we will await it
+# ---- logging ----
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("po-svc")
 
-app = FastAPI()
-
-PO_SVC_TOKEN = os.getenv("PO_SVC_TOKEN", "").strip()
+# ---- env ----
 PO_MOCK = os.getenv("PO_MOCK", "false").lower() == "true"
 PLAYWRIGHT_READY = os.getenv("PLAYWRIGHT_READY", "true").lower() == "true"
 PO_HEADLESS = os.getenv("PO_HEADLESS", "true").lower() == "true"
-PO_BASE_URL = os.getenv("PO_BASE_URL", "https://pocketoption.net/en/").strip()
+PO_BASE_URL = os.getenv("PO_BASE_URL", "https://pocketoption.net/en/")
+
+# service token to protect /po endpoints
+PO_SVC_TOKEN = os.getenv("PO_SVC_TOKEN", "")
+
+# Try to import the scraper only if not mocking
+fetch_candles_async = None
+if not PO_MOCK:
+    try:
+        from scraper import fetch_candles_async  # async function
+    except Exception as e:
+        log.exception("Importer error for scraper.py")
+        # Leave fetch_candles_async as None; we’ll error at request time.
+
+app = FastAPI()
 
 
 @app.get("/")
@@ -31,46 +46,79 @@ async def healthz():
     }
 
 
-def _check_auth(authorization: str | None):
+def _require_bearer(authz: str | None):
     if not PO_SVC_TOKEN:
-        return  # auth disabled
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
-    token = authorization.split(" ", 1)[1].strip()
+        # If you didn’t set a token, allow everything (dev mode).
+        return
+    if not authz or not authz.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = authz.split(" ", 1)[1].strip()
     if token != PO_SVC_TOKEN:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 @app.get("/po/candles")
 async def po_candles(
-    symbol: str = Query(..., description="e.g. EURUSD_OTC"),
-    interval: str = Query("1m", description="e.g. 1m"),
+    symbol: str = Query(..., example="EURUSD_OTC"),
+    interval: str = Query(..., example="1m"),
     limit: int = Query(3, ge=1, le=500),
-    authorization: str | None = Header(None),
-) -> List[Dict]:
-    _check_auth(authorization)
+    authorization: str | None = Header(default=None),
+):
+    """
+    Returns recent candles as:
+    [{"t": <epoch>, "o": <float>, "h": <float>, "l": <float>, "c": <float>}]
+    """
+    _require_bearer(authorization)
 
+    log.info("po_candles called: symbol=%s interval=%s limit=%s mock=%s",
+             symbol, interval, limit, PO_MOCK)
+
+    # Mock branch
     if PO_MOCK:
-        # Simple moving mock so you can test wiring
-        base = 1.0710
-        out = []
-        for i in range(limit):
-            t = 1759770000 + 60 * i
-            o = base + i * 0.0001
-            h = o + 0.0002
-            l = o - 0.0002
-            c = o + 0.00005
-            out.append({"t": t, "o": round(o, 5), "h": round(h, 5), "l": round(l, 5), "c": round(c, 5)})
-        return out
+        import time
+        now = int(time.time() // 60 * 60)
+        series = []
+        for i in range(limit, 0, -1):
+            t = now - i * 60
+            # Tiny, changing values for sanity checks
+            base = 1.071 + (i * 0.00001)
+            series.append({
+                "t": t,
+                "o": round(base, 5),
+                "h": round(base + 0.00015, 5),
+                "l": round(base - 0.00015, 5),
+                "c": round(base + 0.00005, 5),
+            })
+        log.info("mock returned %d candles", len(series))
+        return series
 
+    # Real branch
     if not PLAYWRIGHT_READY:
-        raise HTTPException(status_code=503, detail="Playwright not ready in this environment")
+        raise HTTPException(status_code=503, detail="Playwright not ready")
+
+    if fetch_candles_async is None:
+        # import failed during startup
+        raise HTTPException(
+            status_code=501,
+            detail="Real scraper not wired yet: import of 'scraper' failed (see logs). "
+                   "Set PO_MOCK=true until scraper is implemented.",
+        )
 
     try:
-        # >>> IMPORTANT: we AWAIT the async scraper (no asyncio.run here)
-        candles = await fetch_candles_async(symbol=symbol, interval=interval, limit=limit)
-        return candles
+        # Hard cap to keep requests from hanging forever
+        import asyncio
+        log.info("starting scraper fetch…")
+        candles: List[Dict[str, Any]] = await asyncio.wait_for(
+            fetch_candles_async(symbol=symbol, interval=interval, limit=limit),
+            timeout=70,   # total request cap
+        )
+        log.info("scraper returned %d candles", len(candles))
+        return JSONResponse(candles)
+    except asyncio.TimeoutError:
+        log.error("scraper timed out")
+        raise HTTPException(status_code=504, detail="scraper timeout")
     except HTTPException:
         raise
     except Exception as e:
+        log.exception("scraper error")
         raise HTTPException(status_code=500, detail=f"scraper error: {e}")
