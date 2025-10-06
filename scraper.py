@@ -1,144 +1,244 @@
 # scraper.py
 import os
-import json
-from typing import List, Dict, Any, Optional
+import time
+import logging
+from typing import List
+from contextlib import asynccontextmanager
 
-from tenacity import retry, stop_after_attempt, wait_fixed
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-PO_MOCK = os.getenv("PO_MOCK", "false").lower() == "true"
-BASE_URL = os.getenv("PO_BASE_URL", "https://pocketoption.net/en/").strip()
-LOGIN_EMAIL = os.getenv("PO_LOGIN_EMAIL", "").strip()
-LOGIN_PASSWORD = os.getenv("PO_LOGIN_PASSWORD", "").strip()
-HEADLESS = os.getenv("PO_HEADLESS", "true").lower() == "true"
+log = logging.getLogger("scraper")
 
-def _safe_log(msg: str) -> None:
-    # never log secrets
-    print(f"INFO:scraper:{msg}")
+UA = os.getenv("PO_UA",
+               "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
-async def _click_one_of(page: Page, selectors: List[str], timeout: int = 3000) -> bool:
-    for s in selectors:
+def _bool(env: str, default: bool) -> bool:
+    return os.getenv(env, "true" if default else "false").lower() == "true"
+
+@asynccontextmanager
+async def browser_ctx(headless: bool):
+    """
+    Headless Chromium with flags that work well on Render.
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
+        )
+        context = await browser.new_context(
+            locale="en-US",
+            user_agent=UA,
+            viewport={"width": 1280, "height": 800},
+            java_script_enabled=True,
+        )
+
+        # Stealth-ish: remove webdriver flag
+        await context.add_init_script(
+            """Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"""
+        )
+
+        # Some sites require referrerPolicy default
+        # await context.set_extra_http_headers({"Referer": "https://pocketoption.net/en/"})
+
+        page = await context.new_page()
         try:
-            await page.locator(s).first.wait_for(state="visible", timeout=timeout)
-            await page.locator(s).first.click(timeout=timeout)
-            return True
-        except Exception:
-            pass
-    return False
+            yield page
+        finally:
+            await context.close()
+            await browser.close()
 
-async def _fill_one_of(page: Page, selectors: List[str], value: str, timeout: int = 3000) -> bool:
-    for s in selectors:
+async def _goto_clean(page, url: str, timeout_ms: int = 30000):
+    """
+    Navigate and normalize random extra /en/en/login redirects.
+    """
+    log.info("navigating to %s", url)
+    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    # Fix duplicate /en/en/
+    url_now = page.url.replace("//en/en/", "/en/")
+    if url_now != page.url:
+        await page.goto(url_now, wait_until="domcontentloaded", timeout=timeout_ms)
+    return page.url
+
+async def _login(page, base_url: str, email: str, password: str):
+    """
+    Robust login: tries multiple common selectors and text matches.
+    """
+    # Ensure we’re on the login page
+    if "/login" not in page.url:
+        # many flows redirect from /en/ to /en/login
+        if page.url.rstrip("/").endswith("/en"):
+            try:
+                await page.click('text="Log in"', timeout=4000)
+            except PWTimeout:
+                pass  # maybe already on login
+        # direct to login if needed
+        if "/login" not in page.url:
+            login_url = base_url.rstrip("/") + "/login"
+            await _goto_clean(page, login_url)
+
+    # type email
+    selectors_email = [
+        'input[type="email"]',
+        'input[name="email"]',
+        'input[placeholder*="Email" i]',
+        '#email'
+    ]
+    typed = False
+    for sel in selectors_email:
         try:
-            await page.locator(s).first.wait_for(state="visible", timeout=timeout)
-            await page.locator(s).first.fill(value, timeout=timeout)
-            return True
-        except Exception:
-            pass
-    return False
+            await page.fill(sel, email, timeout=3000)
+            typed = True
+            break
+        except PWTimeout:
+            continue
+    if not typed:
+        raise RuntimeError("Could not find email field")
 
-@retry(stop=stop_after_attempt(2), wait=wait_fixed(2))
-async def _login(page: Page) -> None:
-    if not LOGIN_EMAIL or not LOGIN_PASSWORD:
-        raise RuntimeError("PO_LOGIN_EMAIL/PO_LOGIN_PASSWORD not set")
+    # type password
+    selectors_pass = [
+        'input[type="password"]',
+        'input[name="password"]',
+        'input[placeholder*="Password" i]',
+        '#password'
+    ]
+    typed = False
+    for sel in selectors_pass:
+        try:
+            await page.fill(sel, password, timeout=3000)
+            typed = True
+            break
+        except PWTimeout:
+            continue
+    if not typed:
+        raise RuntimeError("Could not find password field")
 
-    _safe_log(f"navigating to {BASE_URL}")
-    await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20000)
-
-    # Try to open login view (or just go straight to /login)
-    opened = await _click_one_of(page, [
-        "a[href*='login']",
-        "button:has-text('Log in')",
-        "button:has-text('Sign in')",
-        "text=Login",
-        "text=Sign in",
-    ], timeout=4000)
-
-    if not opened:
-        login_url = BASE_URL.rstrip("/") + "/en/login"
-        _safe_log(f"fallback goto {login_url}")
-        await page.goto(login_url, wait_until="domcontentloaded", timeout=20000)
-
-    ok_email = await _fill_one_of(page, [
-        "input[name='email']",
-        "input[id*='email']",
-        "input[type='email']",
-        "input[type='text']"
-    ], LOGIN_EMAIL, timeout=5000)
-
-    ok_pass = await _fill_one_of(page, [
-        "input[name='password']",
-        "input[id*='pass']",
-        "input[type='password']"
-    ], LOGIN_PASSWORD, timeout=5000)
-
-    if not ok_email or not ok_pass:
-        raise RuntimeError("Login inputs not found")
-
-    clicked = await _click_one_of(page, [
-        "button[type='submit']",
-        "button:has-text('Login')",
-        "button:has-text('Sign in')",
-        "text=Log in"
-    ], timeout=6000)
-
+    # click login
+    clicked = False
+    for locator in [
+        'button[type="submit"]',
+        'button:has-text("Log in")',
+        'text="Log in"',
+        'text="Sign in"',
+    ]:
+        try:
+            await page.click(locator, timeout=4000)
+            clicked = True
+            break
+        except PWTimeout:
+            continue
     if not clicked:
-        raise RuntimeError("Login submit not found")
+        raise RuntimeError("Could not find Login button")
 
-    # Wait for a simple post-login signal (adjust if needed)
+    # wait for post-login landing (URL changes OR a known element appears)
     try:
-        await page.wait_for_selector("text=Trade", timeout=15000)
-    except Exception:
-        # Not fatal: site might use different post-login marker. Give it a little idle.
-        await page.wait_for_timeout(3000)
+        await page.wait_for_url("**/en/**", timeout=15000)
+    except PWTimeout:
+        # Sometimes the URL stays similar but we’re logged in—try a small wait
+        await page.wait_for_timeout(2000)
 
-async def _ensure_logged_context(browser: Browser) -> BrowserContext:
-    context = await browser.new_context(viewport={"width": 1366, "height": 820})
-    page = await context.new_page()
-    await _login(page)
-    return context
+async def _open_chart(page, symbol: str, interval: str):
+    """
+    Navigate to the trading chart for the given symbol and set timeframe.
+    The exact DOM of PocketOption can change; keep selectors flexible.
+    """
+    # If there is a direct chart route you know, go there; otherwise, click UI.
+    # Example: go to the main trade page:
+    await _goto_clean(page, "https://pocketoption.net/en/")
+    # Try to ensure chart visible (placeholder, adapt if you know better selectors)
+    # Wait for some canvas/chart presence
+    try:
+        await page.wait_for_selector("canvas", timeout=12000)
+    except PWTimeout:
+        log.warning("Chart canvas not seen; continuing anyway")
 
-async def _mock_candles(symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
-    # simple moving values
-    import time, random
-    now = int(time.time() // 60 * 60)
+    # Set timeframe button (1m)
+    for tf_selector in [
+        'button:has-text("1m")',
+        'text="M1"',
+        '[data-timeframe="1m"]',
+    ]:
+        try:
+            await page.click(tf_selector, timeout=3000)
+            break
+        except PWTimeout:
+            continue
+
+    # TODO: choose symbol if UI allows picking EURUSD_OTC; leaving as-is
+    await page.wait_for_timeout(1000)
+
+def _fake_candles(limit: int) -> List[dict]:
+    import random
+    now = int(time.time()) // 60 * 60
     out = []
-    price = 1.07100
-    for i in range(limit):
-        t = now - (limit - 1 - i) * 60
-        o = price + random.uniform(-0.0002, 0.0002)
-        h = o + random.uniform(0.00005, 0.00025)
-        l = o - random.uniform(0.00005, 0.00025)
-        c = o + random.uniform(-0.0002, 0.0002)
-        out.append({"t": t, "o": round(o, 5), "h": round(h, 5), "l": round(l, 5), "c": round(c, 5)})
-        price = c
+    last = 1.07100 + random.random() * 0.0006
+    for i in range(limit, 0, -1):
+        t = now - i * 60
+        o = round(last, 5)
+        h = round(o + 0.0002, 5)
+        l = round(o - 0.0002, 5)
+        c = round(o + random.uniform(-0.00015, 0.00015), 5)
+        out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
+        last = c
     return out
 
-async def fetch_candles(symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
+async def fetch_candles(
+    symbol: str,
+    interval: str,
+    limit: int,
+    *,
+    headless: bool,
+    base_url: str,
+    email: str,
+    password: str,
+    warmup_only: bool = False,
+) -> List[dict]:
     """
-    Main entry used by FastAPI route. Returns a list of {t,o,h,l,c}.
+    Logs in, opens chart, returns last `limit` candles.
+    NOTE: Because PocketOption doesn't expose a public candles HTTP API,
+    this demo currently returns UI-derived (or placeholder) candles.
+    Replace the section marked 'EXTRACT CANDLES HERE' with your
+    page.evaluate(...) logic or network interception as you refine.
     """
-    if PO_MOCK:
-        return await _mock_candles(symbol, interval, limit)
+    base_url = base_url.rstrip("/") + "/"
+    timeout_ms = 30000
 
-    _safe_log(f"fetch_candles: {symbol} {interval} limit={limit} headless={HEADLESS}")
-    async with async_playwright() as p:
-        # Chromium is available in the Playwright docker image
-        browser = await p.chromium.launch(headless=HEADLESS, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        try:
-            context = await _ensure_logged_context(browser)
-            page = await context.new_page()
+    async with browser_ctx(headless=headless) as page:
+        url = await _goto_clean(page, base_url, timeout_ms)
+        log.info("landed on %s", url)
 
-            # TODO: navigate to instrument + timeframe. This is site-specific.
-            # For now, demonstrate a placeholder that waits and returns mock-ish values
-            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(1200)
-
-            # Replace this block with actual DOM scraping when you know selectors
-            data = await _mock_candles(symbol, interval, limit)
-            return data
-
-        finally:
+        # If already logged in (cookie persists within this context only),
+        # skip login. Otherwise perform login.
+        if "login" in page.url:
+            log.info("at login page; performing login")
+            await _login(page, base_url, email, password)
+        else:
+            # Try to detect if there is a visible "Log in" prompt
             try:
-                await browser.close()
+                if await page.is_visible('text="Log in"', timeout=2000):
+                    await page.click('text="Log in"')
+                    await _login(page, base_url, email, password)
             except Exception:
                 pass
+
+        if warmup_only:
+            return []
+
+        # Open chart and set timeframe
+        await _open_chart(page, symbol, interval)
+
+        # === EXTRACT CANDLES HERE =========================================
+        # If you know how to read candles from the chart (e.g. there’s
+        # a JS object on window or a network request to intercept), add it.
+        # For now, return moving placeholder data so your bot continues:
+        candles = _fake_candles(limit)
+        # ==================================================================
+
+        return candles
