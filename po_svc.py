@@ -1,47 +1,33 @@
-# po_svc.py
-import os, time, random
-from typing import List, Dict
-from fastapi import FastAPI, Header, HTTPException, Request
+import os
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from typing import List
 
-app = FastAPI(title="PO OTC Candles")
+app = FastAPI()
+auth_scheme = HTTPBearer(auto_error=False)
 
-# --- helpers ---------------------------------------------------------------
+PO_SVC_TOKEN = os.getenv("PO_SVC_TOKEN", "")
+PO_MOCK = os.getenv("PO_MOCK", "true").lower() == "true"
+PLAYWRIGHT_READY = os.getenv("PO_PLAYWRIGHT", "true").lower() == "true"
 
-def _require_token(authorization: str | None) -> None:
-    """Simple bearer token check using PO_SVC_TOKEN if it is set."""
-    svc_token = os.getenv("PO_SVC_TOKEN", "").strip()
-    if not svc_token:
-        return  # open if no token configured
-    if not authorization or not authorization.startswith("Bearer "):
+# import scraper only when needed so /healthz is always fast
+def _import_scraper():
+    from scraper import fetch_candles
+    return fetch_candles
+
+class Candle(BaseModel):
+    t: int
+    o: float
+    h: float
+    l: float
+    c: float
+
+def _auth(creds: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+    if not PO_SVC_TOKEN:
+        return  # unsecured
+    if not creds or creds.scheme.lower() != "bearer" or creds.credentials != PO_SVC_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    token = authorization.split(" ", 1)[1]
-    if token != svc_token:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-def _mock_candles(symbol: str, interval: str, limit: int) -> List[Dict]:
-    """
-    Tiny mock generator that produces *changing* values every call.
-    """
-    # base around 1.071 with tiny random noise
-    now = int(time.time())
-    step = 60 if interval.endswith("m") else 60
-    # jitter seed so consecutive calls are different
-    random.seed(now ^ hash(symbol) ^ hash(interval))
-    last_close = 1.0710 + random.uniform(-0.001, 0.001)
-    out: List[Dict] = []
-    # newest last
-    for i in range(limit, 0, -1):
-        ts = (now // step) * step - i * step
-        o = last_close + random.uniform(-0.0002, 0.0002)
-        h = max(o, o + abs(random.uniform(0.00005, 0.00025)))
-        l = min(o, o - abs(random.uniform(0.00005, 0.00025)))
-        c = l + (h - l) * random.random()
-        out.append({"t": ts, "o": round(o, 6), "h": round(h, 6),
-                    "l": round(l, 6), "c": round(c, 6)})
-        last_close = c
-    return out
-
-# --- routes ----------------------------------------------------------------
 
 @app.get("/")
 def root():
@@ -49,44 +35,36 @@ def root():
 
 @app.get("/healthz")
 def healthz():
-    return {
-        "ok": True,
-        "mock": os.getenv("PO_MOCK", "false").lower() == "true",
-        # purely informational flags
-        "playwright": os.getenv("PO_PLAYWRIGHT", "true").lower() == "true",
-    }
+    return {"ok": True, "mock": PO_MOCK, "playwright": PLAYWRIGHT_READY}
 
-@app.get("/po/candles")
-def po_candles(
-    request: Request,
-    symbol: str,
-    interval: str = "1m",
-    limit: int = 3,
-    authorization: str | None = Header(default=None),
-):
+@app.get("/po/candles", response_model=List[Candle], dependencies=[Depends(_auth)])
+def po_candles(symbol: str, interval: str = "1m", limit: int = 3):
     """
-    GET /po/candles?symbol=EURUSD_OTC&interval=1m&limit=3
-
-    If PO_MOCK=true -> returns synthetic candles.
-    Else -> calls scraper.fetch_candles(...) (Playwright).
+    Example: /po/candles?symbol=EURUSD_OTC&interval=1m&limit=3
     """
-    _require_token(authorization)
+    if PO_MOCK:
+        # simple changing mock
+        import time, random
+        now = int(time.time()) // 60 * 60
+        out = []
+        price = 1.0710 + random.random() * 0.001
+        for i in range(limit, 0, -1):
+            t = now - i*60
+            o = round(price, 6)
+            h = round(o + 0.0002, 6)
+            l = round(o - 0.0002, 6)
+            c = round(o + (random.random()-0.5)*0.0003, 6)
+            out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
+        return out
 
-    use_mock = os.getenv("PO_MOCK", "false").lower() == "true"
-    if use_mock:
-        return _mock_candles(symbol, interval, max(1, min(limit, 100)))
-
-    # real path (Playwright)
+    # real scraper
     try:
-        from scraper import fetch_candles  # your real scraper
+        fetch_candles = _import_scraper()
     except Exception as e:
-        raise HTTPException(
-            status_code=501,
-            detail=f"Real scraper not wired yet: {e}. Set PO_MOCK=true until scraper is implemented."
-        )
+        raise HTTPException(status_code=501,
+            detail=f"Real scraper not wired yet: {e}. Set PO_MOCK=true until scraper is implemented.")
 
     try:
-        candles = fetch_candles(symbol=symbol, interval=interval, limit=limit)
-        return candles
+        return fetch_candles(symbol=symbol, interval=interval, limit=limit)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"scraper error: {e}")
