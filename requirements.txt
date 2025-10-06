@@ -4,5 +4,3 @@ httpx==0.27.0
 pydantic==2.8.2
 python-dotenv==1.1.1
 tenacity==9.0.0
-# keep Python client aligned with the base image
-playwright==1.45.0
