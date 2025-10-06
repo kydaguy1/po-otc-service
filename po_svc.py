@@ -1,103 +1,49 @@
-# po_svc.py
-import os
-import time
-import random
-from typing import List, Dict, Optional
+# po_svc.py (Render service)
+import os, time
+from fastapi import FastAPI, Query, Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+app = FastAPI()
+security = HTTPBearer()
 
-app = FastAPI(title="PO OTC Candles Svc")
-auth = HTTPBearer(auto_error=False)
+PO_SVC_TOKEN = os.getenv("PO_SVC_TOKEN", "")
 
-# Config via env
+def require_token(creds: HTTPAuthorizationCredentials = Depends(security)):
+    if not PO_SVC_TOKEN:
+        return  # token check disabled if not set
+    if creds.credentials != PO_SVC_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
 MOCK = os.getenv("PO_MOCK", "false").lower() == "true"
-SVC_TOKEN = os.getenv("PO_SVC_TOKEN")  # if set, /po/candles requires this bearer token
-
-
-def _playwright_ready() -> bool:
-    """
-    Return True if the Playwright python package is importable.
-    (Browsers come from the base image; this is a lightweight check.)
-    """
-    try:
-        import playwright  # noqa: F401
-        return True
-    except Exception:
-        return False
-
+PLAYWRIGHT_READY = os.getenv("PLAYWRIGHT_READY", "false").lower() == "true"
 
 @app.get("/")
-def root() -> Dict[str, bool]:
-    """Simple probe that Render hits with HEAD/GET during warmup."""
+async def root():
     return {"ok": True}
 
-
 @app.get("/healthz")
-def healthz() -> Dict[str, bool]:
-    """No I/O here. Purely reports flags so health stays fast and reliable."""
-    return {"ok": True, "mock": MOCK, "playwright": _playwright_ready()}
-
-
-def _require_token(creds: Optional[HTTPAuthorizationCredentials]) -> bool:
-    """
-    Enforce bearer token if PO_SVC_TOKEN is set.
-    If PO_SVC_TOKEN is not set, the endpoint is open (useful for quick testing).
-    """
-    if SVC_TOKEN:
-        if not creds or creds.scheme.lower() != "bearer" or creds.credentials != SVC_TOKEN:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-    return True
-
+async def healthz():
+    return {"ok": True, "mock": MOCK, "playwright": PLAYWRIGHT_READY}
 
 @app.get("/po/candles")
-def po_candles(
-    symbol: str,
-    interval: str = "1m",
-    limit: int = 3,
-    _: bool = Depends(_require_token),
-) -> List[Dict]:
+async def po_candles(
+    symbol: str = Query(..., description="e.g. EURUSD_OTC"),
+    interval: str = Query(..., description="e.g. 1m"),
+    limit: int = Query(3, ge=1, le=1000),
+    _auth: None = Depends(require_token),
+):
     """
-    Return [{t,o,h,l,c}, ...] candles.
-    - If PO_MOCK=true -> return a small changing mock series (for wiring tests).
-    - Otherwise -> use scraper.fetch_candles (provided by scraper.py).
+    GET with query params, not body.
     """
-    if limit <= 0 or limit > 500:
-        raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+    # If you have a real scraper wired, call it here.
+    # from scraper import fetch_candles
+    # return await fetch_candles(symbol=symbol, interval=interval, limit=limit)
 
-    if MOCK:
-        # Changing mock: generates plausible values so you can test the whole pipeline
-        t0 = int(time.time() // 60 * 60)
-        out: List[Dict] = []
-        p = 1.0712
-        for i in range(limit):
-            d = random.uniform(-0.00025, 0.00025)
-            o = round(p, 6)
-            h = round(p + abs(d), 6)
-            l = round(p - abs(d), 6)
-            c = round(p + d / 2, 6)
-            out.append({"t": t0 + i * 60, "o": o, "h": h, "l": l, "c": c})
-            p = c
-        return out
-
-    # Real mode — call Playwright scraper
-    try:
-        from scraper import fetch_candles  # your async Playwright wrapper (sync facade)
-    except Exception as e:
-        # scraper.py missing or import error -> 501 is appropriate for "not implemented"
-        raise HTTPException(status_code=501, detail=f"Real scraper not available: {e}")
-
-    try:
-        data = fetch_candles(symbol, interval, limit)
-        # Basic sanity: must be list[dict] with required keys
-        if not isinstance(data, list) or not all(
-            isinstance(x, dict) and {"t", "o", "h", "l", "c"} <= set(x.keys())
-            for x in data
-        ):
-            raise ValueError("scraper returned unexpected structure")
-        return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Bubble up readable error for logs/curl
-        raise HTTPException(status_code=500, detail=f"scraper error: {e}")
+    # Temporary sample data so the endpoint works immediately:
+    now = int(time.time() // 60 * 60)
+    base = 1.071
+    out = []
+    for i in range(limit, 0, -1):
+        b = base + (i % 7) * 0.0001
+        out.append({"t": now - i*60, "o": b, "h": b+0.00015, "l": b-0.00015, "c": b+0.00005})
+    return out
