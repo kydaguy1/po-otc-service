@@ -10,13 +10,31 @@ PLAYWRIGHT_READY = os.getenv("PLAYWRIGHT_READY", "false").lower() == "true"
 SVC_TOKEN = os.getenv("PO_SVC_TOKEN", "")
 
 def _auth(authorization: str | None):
-    if not SVC_TOKEN:  # open if no token configured
+    if not SVC_TOKEN:
         return
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    token = authorization.removeprefix("Bearer ").strip()
-    if token != SVC_TOKEN:
+    if authorization.removeprefix("Bearer ").strip() != SVC_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+@app.on_event("startup")
+async def _on_startup():
+    if not MOCK:
+        try:
+            from scraper import startup
+            await startup()
+        except Exception as e:
+            # We still start; health will report playwright:false if desired
+            print("SCRAPER startup error:", e)
+
+@app.on_event("shutdown")
+async def _on_shutdown():
+    if not MOCK:
+        try:
+            from scraper import shutdown
+            await shutdown()
+        except Exception as e:
+            print("SCRAPER shutdown error:", e)
 
 @app.get("/")
 async def root():
@@ -29,14 +47,13 @@ async def healthz():
 @app.get("/po/candles")
 async def candles(
     symbol: str = Query(..., description="e.g. EURUSD_OTC"),
-    interval: str = Query("1m", description="1m/5m/etc"),
+    interval: str = Query("1m"),
     limit: int = Query(120, ge=1, le=500),
     authorization: str | None = Header(None, alias="Authorization"),
 ):
     _auth(authorization)
 
     if MOCK:
-        # Time-based mock so values actually change (useful for wiring tests)
         now = int(time.time() // 60 * 60)
         base = 1.07000 + (now % 13) / 10000.0
         out = []
@@ -49,14 +66,8 @@ async def candles(
             out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
         return out
 
-    # REAL mode: call your Playwright scraper.
-    # Implement fetch_candles(symbol, interval, limit) inside scraper.py.
+    from scraper import fetch_candles
     try:
-        from scraper import fetch_candles  # you supply this
-    except Exception as e:  # pragma: no cover
-        raise HTTPException(
-            status_code=501,
-            detail=f"Real scraper not wired yet: {e}. Set PO_MOCK=true until scraper is implemented.",
-        )
-    data = await fetch_candles(symbol=symbol, interval=interval, limit=limit)
-    return data
+        return await fetch_candles(symbol=symbol, interval=interval, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Scraper failed: {e}")
