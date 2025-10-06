@@ -1,40 +1,33 @@
 # po_svc.py
 import os
-import time
-from fastapi import FastAPI, Header, HTTPException, Query
+import json
+import logging
+from typing import List, Dict, Any
+from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-app = FastAPI()
-
-MOCK = os.getenv("PO_MOCK", "true").lower() == "true"
+# ---- configuration via env
+MOCK = os.getenv("PO_MOCK", "false").lower() == "true"
 PLAYWRIGHT_READY = os.getenv("PLAYWRIGHT_READY", "false").lower() == "true"
-SVC_TOKEN = os.getenv("PO_SVC_TOKEN", "")
+SVC_TOKEN = os.getenv("PO_SVC_TOKEN", "")  # optional bearer
+TZ = os.getenv("TZ", "UTC")
 
-def _auth(authorization: str | None):
+# logging
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("po-api")
+
+# optional auth
+bearer = HTTPBearer(auto_error=False)
+
+def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)):
     if not SVC_TOKEN:
-        return
-    if not authorization or not authorization.startswith("Bearer "):
+        return True  # auth disabled
+    if not creds or creds.scheme.lower() != "bearer" or creds.credentials != SVC_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    if authorization.removeprefix("Bearer ").strip() != SVC_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
 
-@app.on_event("startup")
-async def _on_startup():
-    if not MOCK:
-        try:
-            from scraper import startup
-            await startup()
-        except Exception as e:
-            # We still start; health will report playwright:false if desired
-            print("SCRAPER startup error:", e)
-
-@app.on_event("shutdown")
-async def _on_shutdown():
-    if not MOCK:
-        try:
-            from scraper import shutdown
-            await shutdown()
-        except Exception as e:
-            print("SCRAPER shutdown error:", e)
+app = FastAPI(title="PO OTC service")
 
 @app.get("/")
 async def root():
@@ -44,30 +37,58 @@ async def root():
 async def healthz():
     return {"ok": True, "mock": MOCK, "playwright": PLAYWRIGHT_READY}
 
-@app.get("/po/candles")
-async def candles(
+# ---- mock data
+def _mock_candles(limit: int) -> List[Dict[str, Any]]:
+    import time, random
+    now = int(time.time() // 60 * 60)
+    out = []
+    price = 1.07150
+    for i in range(limit)[::-1]:
+        t = now - i * 60
+        o = price + random.uniform(-0.0002, 0.0002)
+        h = o + random.uniform(0.0, 0.0003)
+        l = o - random.uniform(0.0, 0.0003)
+        c = o + random.uniform(-0.0002, 0.0002)
+        out.append({"t": t, "o": round(o, 6), "h": round(h, 6), "l": round(l, 6), "c": round(c, 6)})
+        price = c
+    return out
+
+# ---- real endpoint
+@app.get("/po/candles", response_class=JSONResponse)
+async def po_candles(
     symbol: str = Query(..., description="e.g. EURUSD_OTC"),
-    interval: str = Query("1m"),
-    limit: int = Query(120, ge=1, le=500),
-    authorization: str | None = Header(None, alias="Authorization"),
+    interval: str = Query("1m", description="1m only for now"),
+    limit: int = Query(120, ge=1, le=200),
+    _auth_ok: bool = Depends(require_auth),
 ):
-    _auth(authorization)
-
     if MOCK:
-        now = int(time.time() // 60 * 60)
-        base = 1.07000 + (now % 13) / 10000.0
-        out = []
-        for i in range(limit):
-            t = now - 60 * (limit - 1 - i)
-            o = round(base + (i % 3) * 0.00003, 6)
-            h = round(o + 0.00020, 6)
-            l = round(o - 0.00020, 6)
-            c = round(o + ((i % 2) * 2 - 1) * 0.00004, 6)
-            out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
-        return out
+        return _mock_candles(limit)
 
-    from scraper import fetch_candles
+    if not PLAYWRIGHT_READY:
+        # clearly tell the caller what to fix
+        raise HTTPException(status_code=503, detail="Playwright is not ready on this instance. Set PLAYWRIGHT_READY=true and redeploy.")
+
     try:
-        return await fetch_candles(symbol=symbol, interval=interval, limit=limit)
+        from scraper import fetch_candles  # <- provided below
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Scraper failed: {e}")
+        log.exception("Importer error for scraper.py")
+        raise HTTPException(
+            status_code=501,
+            detail=f"Real scraper not wired yet: {e}. Set PO_MOCK=true until scraper is implemented."
+        )
+
+    try:
+        candles = await fetch_candles(symbol=symbol, interval=interval, limit=limit)
+        if not candles:
+            raise HTTPException(status_code=502, detail="Scraper returned no data.")
+        # Normalize + truncate to 'limit'
+        out = [
+            {"t": int(c["t"]), "o": float(c["o"]), "h": float(c["h"]), "l": float(c["l"]), "c": float(c["c"])}
+            for c in candles
+        ]
+        return out[-limit:]
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Scraper failed")
+        raise HTTPException(status_code=500, detail=f"Scraper failed: {e}")
