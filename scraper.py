@@ -1,244 +1,182 @@
 # scraper.py
-import os
-import time
-import logging
-from typing import List
-from contextlib import asynccontextmanager
+import asyncio
+from typing import List, Dict, Optional
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-log = logging.getLogger("scraper")
 
-UA = os.getenv("PO_UA",
-               "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-               "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-
-def _bool(env: str, default: bool) -> bool:
-    return os.getenv(env, "true" if default else "false").lower() == "true"
-
-@asynccontextmanager
-async def browser_ctx(headless: bool):
-    """
-    Headless Chromium with flags that work well on Render.
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=headless,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ],
-        )
-        context = await browser.new_context(
-            locale="en-US",
-            user_agent=UA,
-            viewport={"width": 1280, "height": 800},
-            java_script_enabled=True,
-        )
-
-        # Stealth-ish: remove webdriver flag
-        await context.add_init_script(
-            """Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"""
-        )
-
-        # Some sites require referrerPolicy default
-        # await context.set_extra_http_headers({"Referer": "https://pocketoption.net/en/"})
-
-        page = await context.new_page()
-        try:
-            yield page
-        finally:
-            await context.close()
-            await browser.close()
-
-async def _goto_clean(page, url: str, timeout_ms: int = 30000):
-    """
-    Navigate and normalize random extra /en/en/login redirects.
-    """
-    log.info("navigating to %s", url)
-    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-    # Fix duplicate /en/en/
-    url_now = page.url.replace("//en/en/", "/en/")
-    if url_now != page.url:
-        await page.goto(url_now, wait_until="domcontentloaded", timeout=timeout_ms)
-    return page.url
-
-async def _login(page, base_url: str, email: str, password: str):
-    """
-    Robust login: tries multiple common selectors and text matches.
-    """
-    # Ensure we’re on the login page
-    if "/login" not in page.url:
-        # many flows redirect from /en/ to /en/login
-        if page.url.rstrip("/").endswith("/en"):
-            try:
-                await page.click('text="Log in"', timeout=4000)
-            except PWTimeout:
-                pass  # maybe already on login
-        # direct to login if needed
-        if "/login" not in page.url:
-            login_url = base_url.rstrip("/") + "/login"
-            await _goto_clean(page, login_url)
-
-    # type email
-    selectors_email = [
-        'input[type="email"]',
-        'input[name="email"]',
-        'input[placeholder*="Email" i]',
-        '#email'
+async def _login(page, email: str, password: str):
+    # Navigate to login; support both /en/ and /en/en/login fallback
+    await page.goto("/", wait_until="domcontentloaded")
+    # Try common login entry points
+    locators = [
+        "text=Log in",
+        "text=Login",
+        "a[href*='login']",
+        "button:has-text('Log in')",
+        "button:has-text('Login')",
     ]
-    typed = False
-    for sel in selectors_email:
+    for sel in locators:
         try:
-            await page.fill(sel, email, timeout=3000)
-            typed = True
-            break
+            btn = page.locator(sel)
+            if await btn.count() > 0:
+                await btn.first.click()
+                break
         except PWTimeout:
-            continue
-    if not typed:
-        raise RuntimeError("Could not find email field")
+            pass
 
-    # type password
-    selectors_pass = [
-        'input[type="password"]',
-        'input[name="password"]',
-        'input[placeholder*="Password" i]',
-        '#password'
+    # Fill credentials (try multiple selectors to be robust)
+    email_fields = [
+        "input[type='email']",
+        "input[name='email']",
+        "input[placeholder*='email' i]",
+        "input[name='username']",
+        "input[type='text']",
     ]
-    typed = False
-    for sel in selectors_pass:
-        try:
-            await page.fill(sel, password, timeout=3000)
-            typed = True
-            break
-        except PWTimeout:
-            continue
-    if not typed:
-        raise RuntimeError("Could not find password field")
+    pass_fields = [
+        "input[type='password']",
+        "input[name='password']",
+        "input[placeholder*='password' i]",
+    ]
+    login_buttons = [
+        "button[type='submit']",
+        "button:has-text('Log in')",
+        "button:has-text('Login')",
+        "text=Sign in",
+        "text=Log in",
+    ]
 
-    # click login
-    clicked = False
-    for locator in [
-        'button[type="submit"]',
-        'button:has-text("Log in")',
-        'text="Log in"',
-        'text="Sign in"',
-    ]:
-        try:
-            await page.click(locator, timeout=4000)
-            clicked = True
+    # Fill email
+    for sel in email_fields:
+        if await page.locator(sel).count():
+            await page.fill(sel, email)
             break
-        except PWTimeout:
-            continue
-    if not clicked:
-        raise RuntimeError("Could not find Login button")
+    # Fill password
+    for sel in pass_fields:
+        if await page.locator(sel).count():
+            await page.fill(sel, password)
+            break
+    # Click login
+    for sel in login_buttons:
+        if await page.locator(sel).count():
+            await page.locator(sel).first.click()
+            break
 
-    # wait for post-login landing (URL changes OR a known element appears)
+    # Wait for post-login indicator (adjust as needed)
+    # If the site redirects back to /en/, networkidle is a decent proxy
     try:
-        await page.wait_for_url("**/en/**", timeout=15000)
+        await page.wait_for_load_state("networkidle", timeout=15000)
     except PWTimeout:
-        # Sometimes the URL stays similar but we’re logged in—try a small wait
-        await page.wait_for_timeout(2000)
+        # Continue; not fatal — some pages stream forever
+        pass
 
-async def _open_chart(page, symbol: str, interval: str):
+
+async def _extract_candles_from_page(page, symbol: str, interval: str, limit: int) -> List[Dict]:
     """
-    Navigate to the trading chart for the given symbol and set timeframe.
-    The exact DOM of PocketOption can change; keep selectors flexible.
+    Example extraction stub.
+    This tries a few obvious patterns. If none work, it raises so the service
+    returns a clear 500 instead of hanging.
     """
-    # If there is a direct chart route you know, go there; otherwise, click UI.
-    # Example: go to the main trade page:
-    await _goto_clean(page, "https://pocketoption.net/en/")
-    # Try to ensure chart visible (placeholder, adapt if you know better selectors)
-    # Wait for some canvas/chart presence
-    try:
-        await page.wait_for_selector("canvas", timeout=12000)
-    except PWTimeout:
-        log.warning("Chart canvas not seen; continuing anyway")
+    # If there's a global JS object or embedded TradingView, you could evaluate it.
+    # The following is a conservative placeholder — adapt for the site you see.
+    js_snippet = """
+    () => {
+      // Try to find any candle-like structures in window variables
+      const walk = (obj, depth=0) => {
+        if (!obj || depth > 3) return [];
+        const out = [];
+        if (Array.isArray(obj) && obj.length && typeof obj[0] === 'object') {
+          const sample = obj[0];
+          if (['t','o','h','l','c'].every(k => k in sample)) {
+            return obj;
+          }
+        }
+        for (const k of Object.keys(obj)) {
+          try {
+            const v = obj[k];
+            if (v && typeof v === 'object') {
+              const r = walk(v, depth+1);
+              if (r && r.length) return r;
+            }
+          } catch {}
+        }
+        return [];
+      };
+      try {
+        const found = walk(window);
+        return found.slice(-300); // cap
+      } catch (e) {
+        return [];
+      }
+    }
+    """
+    data = await page.evaluate(js_snippet)
+    if isinstance(data, list) and data:
+        # Clip to requested limit
+        return data[-limit:]
 
-    # Set timeframe button (1m)
-    for tf_selector in [
-        'button:has-text("1m")',
-        'text="M1"',
-        '[data-timeframe="1m"]',
-    ]:
-        try:
-            await page.click(tf_selector, timeout=3000)
-            break
-        except PWTimeout:
-            continue
+    # If nothing found, fail clearly
+    raise RuntimeError("Unable to locate candle data on page")
 
-    # TODO: choose symbol if UI allows picking EURUSD_OTC; leaving as-is
-    await page.wait_for_timeout(1000)
-
-def _fake_candles(limit: int) -> List[dict]:
-    import random
-    now = int(time.time()) // 60 * 60
-    out = []
-    last = 1.07100 + random.random() * 0.0006
-    for i in range(limit, 0, -1):
-        t = now - i * 60
-        o = round(last, 5)
-        h = round(o + 0.0002, 5)
-        l = round(o - 0.0002, 5)
-        c = round(o + random.uniform(-0.00015, 0.00015), 5)
-        out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
-        last = c
-    return out
 
 async def fetch_candles(
     symbol: str,
     interval: str,
     limit: int,
-    *,
-    headless: bool,
     base_url: str,
+    headless: bool,
     email: str,
     password: str,
-    warmup_only: bool = False,
-) -> List[dict]:
+    logger=None,
+) -> List[Dict]:
     """
-    Logs in, opens chart, returns last `limit` candles.
-    NOTE: Because PocketOption doesn't expose a public candles HTTP API,
-    this demo currently returns UI-derived (or placeholder) candles.
-    Replace the section marked 'EXTRACT CANDLES HERE' with your
-    page.evaluate(...) logic or network interception as you refine.
+    Main entry called by FastAPI. Must be async (NO asyncio.run here).
+    Returns list of dicts: {t,o,h,l,c}
     """
-    base_url = base_url.rstrip("/") + "/"
-    timeout_ms = 30000
+    base = base_url.rstrip("/")  # e.g. https://pocketoption.net/en
+    if logger:
+        logger.info("scraper:navigating to %s/", base)
 
-    async with browser_ctx(headless=headless) as page:
-        url = await _goto_clean(page, base_url, timeout_ms)
-        log.info("landed on %s", url)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        context = await browser.new_context(
+            base_url=base,
+            viewport={"width": 1280, "height": 800},
+        )
+        page = await context.new_page()
 
-        # If already logged in (cookie persists within this context only),
-        # skip login. Otherwise perform login.
-        if "login" in page.url:
-            log.info("at login page; performing login")
-            await _login(page, base_url, email, password)
-        else:
-            # Try to detect if there is a visible "Log in" prompt
+        try:
+            # 1) Login
+            await _login(page, email=email, password=password)
+
+            # 2) Navigate to trading/home where candles are present
+            # (If a specific URL is required, replace the below with it)
             try:
-                if await page.is_visible('text="Log in"', timeout=2000):
-                    await page.click('text="Log in"')
-                    await _login(page, base_url, email, password)
-            except Exception:
+                await page.goto("/", wait_until="domcontentloaded", timeout=20000)
+            except PWTimeout:
                 pass
 
-        if warmup_only:
-            return []
+            # 3) Extract
+            candles = await _extract_candles_from_page(page, symbol, interval, limit)
 
-        # Open chart and set timeframe
-        await _open_chart(page, symbol, interval)
+            # Basic validation/normalization
+            out: List[Dict] = []
+            for row in candles[-limit:]:
+                t = int(row.get("t"))
+                o = float(row.get("o"))
+                h = float(row.get("h"))
+                l = float(row.get("l"))
+                c = float(row.get("c"))
+                out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
 
-        # === EXTRACT CANDLES HERE =========================================
-        # If you know how to read candles from the chart (e.g. there’s
-        # a JS object on window or a network request to intercept), add it.
-        # For now, return moving placeholder data so your bot continues:
-        candles = _fake_candles(limit)
-        # ==================================================================
+            return out
 
-        return candles
+        finally:
+            await context.close()
+            await browser.close()
