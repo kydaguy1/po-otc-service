@@ -2,10 +2,8 @@ FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
 
 ENV PYTHONUNBUFFERED=1
 
-# Install FastAPI and uvicorn
 RUN pip install --no-cache-dir fastapi uvicorn[standard] tenacity
 
-# Copy app
 WORKDIR /app
 COPY po_svc.py /app/po_svc.py
 COPY scraper.py /app/scraper.py
