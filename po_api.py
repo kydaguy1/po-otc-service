@@ -1,47 +1,28 @@
-"""
-FastAPI app exposing:
-  GET /health
-  GET /symbols?token=...
-  GET /candles?symbol=...&interval=1m&limit=200&token=...
-
-Auth:
-  All endpoints except /health require a 'token' query param
-  that matches PO_SVC_TOKEN (env in Render).
-
-Upstream:
-  If PO_UPSTREAM_URL is set in the environment, po_svc.fetch_candles will
-  proxy there. Otherwise it returns 503 telling you to configure it.
-"""
-from __future__ import annotations
-
-from typing import Optional
-
-from fastapi import Depends, FastAPI, Query
+# po_api.py
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-
+from typing import Optional
 from po_svc import verify_token, list_symbols, fetch_candles
 
-app = FastAPI(title="PO OTC Service", version="1.0.0")
+app = FastAPI(title="PO OTC Datafeed", version="1.0")
 
-# ----- Dependencies -----
-def auth(token: Optional[str] = Query(None)) -> None:
-    verify_token(token)
-
-# ----- Routes -----
 @app.get("/health")
 def health():
     return {"ok": True}
 
+def _check_token(token: Optional[str]):
+    if not token or not verify_token(token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
 @app.get("/symbols")
-def symbols(_: None = Depends(auth)):
-    return list_symbols()
+def symbols(token: str = Query(...)):
+    _check_token(token)
+    return {"symbols": list_symbols()}
 
 @app.get("/candles")
-async def candles(
-    symbol: str = Query(..., description="e.g. EURUSD_OTC"),
-    interval: str = Query("1m"),
-    limit: int = Query(200, ge=1, le=1200),
-    _: None = Depends(auth),
-):
-    data = await fetch_candles(symbol, interval, limit)
-    return JSONResponse(content=data)
+def candles(symbol: str, interval: str = "1m", limit: int = 200, token: str = Query(...)):
+    _check_token(token)
+    data = fetch_candles(symbol, interval, limit)
+    if not data.get("candles"):
+        raise HTTPException(status_code=404, detail="No data")
+    return JSONResponse(data)
