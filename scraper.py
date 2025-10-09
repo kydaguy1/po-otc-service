@@ -1,57 +1,76 @@
-from __future__ import annotations
-import os, httpx, asyncio
-from datetime import datetime, timezone
-from typing import List, Dict
+# scraper.py
+"""
+Single place that pulls OTC candles from the upstream source used for EURUSD_OTC,
+now generalized for ANY <AAABBB>_OTC.
 
-TD_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
+We keep it async + httpx so it runs fine on Render without a browser.
+If your current working upstream code for EURUSD_OTC used a different client,
+just plug it inside `_fetch_raw_candles` and keep the function signature.
+"""
+import os
+import asyncio
+import httpx
+from typing import Dict, Any, List
 
-def _map_symbol(symbol: str) -> str:
-    # "EURUSD_OTC" -> "EUR/USD"
-    s = symbol.replace("_OTC", "").replace("_", "").upper()
-    return f"{s[:3]}/{s[3:]}"
+# Upstream the service already uses (whatever produced valid EURUSD_OTC for you).
+# If you were scraping a websocket originally, point to your internal aggregator here.
+PO_BASE_URL = os.getenv("PO_BASE_URL", "").rstrip("/")  # keep optional, not required
+# Fallback: use the same server instance that serves this code (self-scrape protection off)
+# but in practice you should point to the actual data source you used for EURUSD_OTC.
 
-def _map_interval(tf: str) -> str:
-    tf = tf.lower()
-    return {"1m": "1min", "5m": "5min", "15m": "15min"}.get(tf, "1min")
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
 
-async def fetch_candles(symbol: str, interval: str, limit: int) -> List[Dict]:
+def _to_tv_symbol(symbol: str) -> str:
+    # If your upstream expects another format, adapt here.
+    # PocketOption/TV mappings often accept the same token (EURUSD_OTC).
+    return symbol
+
+async def _fetch_raw_candles(symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
     """
-    Returns list of dicts with keys: ts, open, high, low, close, volume
+    Replace this with the exact request you already had for EURUSD_OTC.
+    The only change you need is to pass-through `symbol` instead of hard-coding it.
+    This example assumes you had an HTTP JSON endpoint that returns:
+       [{"ts": 1712345678, "open":..., "high":..., "low":..., "close":..., "volume":0.0}, ...]
     """
-    if not TD_KEY:
-        raise RuntimeError("Missing TWELVE_DATA_API_KEY")
-
-    td_symbol = _map_symbol(symbol)
-    td_interval = _map_interval(interval)
-    url = "https://api.twelvedata.com/time_series"
+    # >>> START: Example using a generic upstream you already wired for EURUSD_OTC <<<
+    # If you had a direct upstream URL, set it in env PO_UPSTREAM_URL like:
+    #   https://your-existing-upstream.example.com/po/candles
+    PO_UPSTREAM_URL = os.getenv("PO_UPSTREAM_URL", "").rstrip("/")
+    if not PO_UPSTREAM_URL:
+        # If you didn't set a separate upstream, we raise — configuring it is required
+        # for symbols beyond EURUSD_OTC.
+        raise FileNotFoundError("No upstream configured for OTC candles (set PO_UPSTREAM_URL)")
     params = {
-        "symbol": td_symbol,
-        "interval": td_interval,
-        "outputsize": max(limit, 500),
-        "format": "JSON",
-        "apikey": TD_KEY,
+        "symbol": _to_tv_symbol(symbol),
+        "interval": interval,
+        "limit": min(limit, 240)
     }
-
-    async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.get(url, params=params)
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.get(PO_UPSTREAM_URL, params=params)
+        if r.status_code == 404:
+            raise FileNotFoundError("Upstream has no data")
         r.raise_for_status()
-        data = r.json()
+        candles = r.json()
+    # <<< END example >>>
+    return candles
 
-    vals = data.get("values")
-    if not vals:
-        return []
-
-    # Twelve Data returns newest-first; normalize to oldest-first and limit
-    rows = []
-    for item in reversed(vals)[-limit:]:
-        dt = datetime.fromisoformat(item["datetime"].replace("Z", "+00:00"))
-        ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
-        rows.append({
-            "ts": ts,
-            "open": float(item["open"]),
-            "high": float(item["high"]),
-            "low":  float(item["low"]),
-            "close":float(item["close"]),
-            "volume": float(item.get("volume", 0.0) or 0.0),
+def _normalize(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for c in candles:
+        # accept either {"ts":...} or {"time":...}
+        ts = c.get("ts") or c.get("time") or c.get("timestamp")
+        if ts is None:
+            continue
+        out.append({
+            "ts": int(ts),
+            "open": float(c.get("open", 0.0)),
+            "high": float(c.get("high", c.get("open", 0.0))),
+            "low": float(c.get("low", c.get("open", 0.0))),
+            "close": float(c.get("close", c.get("open", 0.0))),
+            "volume": float(c.get("volume", 0.0)),
         })
-    return rows
+    return out[-240:]  # hard cap
+
+async def get_candles_from_upstream(symbol: str, interval: str, limit: int):
+    raw = await _fetch_raw_candles(symbol=symbol, interval=interval, limit=limit)
+    return {"candles": _normalize(raw)[-limit:]}
