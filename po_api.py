@@ -1,43 +1,47 @@
-# po_api.py
-import os
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+"""
+FastAPI app exposing:
+  GET /health
+  GET /symbols?token=...
+  GET /candles?symbol=...&interval=1m&limit=200&token=...
+
+Auth:
+  All endpoints except /health require a 'token' query param
+  that matches PO_SVC_TOKEN (env in Render).
+
+Upstream:
+  If PO_UPSTREAM_URL is set in the environment, po_svc.fetch_candles will
+  proxy there. Otherwise it returns 503 telling you to configure it.
+"""
+from __future__ import annotations
+
 from typing import Optional
+
+from fastapi import Depends, FastAPI, Query
+from fastapi.responses import JSONResponse
+
 from po_svc import verify_token, list_symbols, fetch_candles
 
-app = FastAPI(title="PO OTC Service", version="1.2.0")
+app = FastAPI(title="PO OTC Service", version="1.0.0")
 
+# ----- Dependencies -----
+def auth(token: Optional[str] = Query(None)) -> None:
+    verify_token(token)
+
+# ----- Routes -----
 @app.get("/health")
 def health():
     return {"ok": True}
 
 @app.get("/symbols")
-def symbols(token: str = Query(..., description="service token")):
-    verify_token(token)
-    return {"symbols": list_symbols()}
+def symbols(_: None = Depends(auth)):
+    return list_symbols()
 
 @app.get("/candles")
 async def candles(
     symbol: str = Query(..., description="e.g. EURUSD_OTC"),
-    interval: str = Query("1m", description="1m|5m|15m"),
-    limit: int = Query(200, ge=1, le=240),
-    token: str = Query(...)
+    interval: str = Query("1m"),
+    limit: int = Query(200, ge=1, le=1200),
+    _: None = Depends(auth),
 ):
-    verify_token(token)
-
-    try:
-        data = await fetch_candles(symbol=symbol, interval=interval, limit=limit)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except FileNotFoundError:
-        # Upstream has no data for this symbol right now
-        raise HTTPException(status_code=404, detail="No data")
-    except Exception as e:
-        # Don’t leak internals
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if not data or not data.get("candles"):
-        # normalize empty -> 404 so callers can backoff
-        raise HTTPException(status_code=404, detail="No data")
-
-    return JSONResponse(data)
+    data = await fetch_candles(symbol, interval, limit)
+    return JSONResponse(content=data)
