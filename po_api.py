@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timezone
 
-# --- Auth ---
+# ── Auth (query ?token=...) ─────────────────────────────────────
 APP_TOKEN = os.getenv("PO_SVC_TOKEN", "")
 
 def auth(token: Optional[str] = Query(default=None, alias="token")):
@@ -13,14 +13,15 @@ def auth(token: Optional[str] = Query(default=None, alias="token")):
         raise HTTPException(status_code=401, detail="Unauthorized")
     return True
 
-# --- Twelve Data backend (placeholder until real PO OTC is added) ---
+# ── Temporary data source: Twelve Data (swap later to true PO) ─
 TD_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
+
 def td_symbol(symbol: str) -> str:
-    s = symbol.replace("_OTC","").replace("_","").upper()
+    s = symbol.replace("_OTC", "").replace("_", "").upper()
     return f"{s[:3]}/{s[3:]}"
 
 def td_interval(tf: str) -> str:
-    return {"1m":"1min","5m":"5min","15m":"15min"}.get(tf.lower(),"1min")
+    return {"1m": "1min", "5m": "5min", "15m": "15min"}.get(tf.lower(), "1min")
 
 async def fetch_candles(symbol: str, interval: str, limit: int):
     if not TD_KEY:
@@ -36,21 +37,23 @@ async def fetch_candles(symbol: str, interval: str, limit: int):
         r = await client.get("https://api.twelvedata.com/time_series", params=params)
         r.raise_for_status()
         data = r.json()
+
     vals = data.get("values") or []
-    rows = []
-    for item in reversed(vals)[-limit:]:
-        dt = datetime.fromisoformat(item["datetime"].replace("Z","+00:00")).astimezone(timezone.utc)
+    rows: List[dict] = []
+    # FIX: convert reversed iterator to list before slicing
+    for item in list(reversed(vals))[-limit:]:
+        dt = datetime.fromisoformat(item["datetime"].replace("Z", "+00:00")).astimezone(timezone.utc)
         rows.append({
             "ts": int(dt.timestamp()),
             "open": float(item["open"]),
             "high": float(item["high"]),
             "low":  float(item["low"]),
-            "close":float(item["close"]),
+            "close": float(item["close"]),
             "volume": float(item.get("volume") or 0.0),
         })
     return rows
 
-# --- FastAPI app ---
+# ── API ─────────────────────────────────────────────────────────
 app = FastAPI(title="PO OTC Candles API", version="1.0.0")
 
 class Candle(BaseModel):
@@ -66,7 +69,10 @@ def health(): return {"ok": True}
 async def api_candles(symbol: str, interval: str = "1m", limit: int = 200, _=Depends(auth)):
     try:
         rows = await fetch_candles(symbol, interval, limit)
-        if not rows: raise HTTPException(status_code=404, detail="No data")
+        if not rows:
+            raise HTTPException(status_code=404, detail="No data")
         return {"symbol": symbol, "interval": interval, "candles": rows}
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
